@@ -52,6 +52,7 @@ from plotly.subplots import make_subplots
 from dataclasses import dataclass
 
 from scipy.optimize import minimize, linear_sum_assignment
+from scipy.special import roots_legendre
 
 
 # ============================================================
@@ -529,6 +530,110 @@ def sweep_wavevector(k_values, B, p):
     return freqs, vecs, results
 
 
+
+# ============================================================
+# Thickness-resolved modes (full dynamical matrix)
+# ============================================================
+
+def thickness_phi(z, n_modes, d):
+    """Orthonormal free-surface cosine basis, shape (n_modes, len(z))."""
+    z = np.atleast_1d(z)
+    phi = np.zeros((n_modes, len(z)))
+    phi[0] = 1.0 / np.sqrt(d)
+    for n in range(1, n_modes):
+        phi[n] = np.sqrt(2.0 / d) * np.cos(n * np.pi * (z + d / 2.0) / d)
+    return phi
+
+
+def solve_thickness_modes(kpar, B, p, d, n_modes=6, equilibrium=None,
+                          dKh=None, n_quad=200):
+    """
+    Modes of a film of thickness d: delta m_i(z) = sum_n c_in phi_n(z),
+    state vector (a1, b1, a2, b2) for each n, so the dynamical matrix is
+    4 n_modes x 4 n_modes and 2 n_modes positive-frequency modes are found.
+
+    Matrix = tangent Hessian at kpar (same for every n)
+           + exchange q_z^2 terms (q_z = n pi/d, diagonal in n)
+           + optional z-dependent hard-axis anisotropy dKh(z) (J/m^3, added to
+             Kh), projected on the basis: couples different n.
+    The static state is kept uniform in z (exact for in-plane moments, since a
+    hard-axis term does not move them).
+
+    Returns dict with frequency (2 n_modes,) ascending, eigenvectors
+    (4 n_modes, 2 n_modes), n_weight (n_modes, 2 n_modes) = weight of each
+    basis mode n in each eigenmode, plus equilibrium, d, n_modes, tangent.
+    """
+    B = np.asarray(B, dtype=float)
+    m1, m2 = find_equilibrium(B, p) if equilibrium is None else equilibrium
+
+    H0, _, T, T1, T2 = tangent_hessian(m1, m2, B, p)
+    I2 = np.eye(2)
+    nm = n_modes
+    Hbig = np.zeros((4 * nm, 4 * nm))
+
+    for n in range(nm):
+        k2 = kpar**2 + (n * np.pi / d) ** 2
+        Hk = np.block([
+            [2 * p.A * k2 * I2, p.A12 * k2 * (T1.T @ T2)],
+            [p.A12 * k2 * (T2.T @ T1), 2 * p.A * k2 * I2],
+        ])
+        Hbig[4 * n:4 * n + 4, 4 * n:4 * n + 4] = H0 + Hk
+
+    if dKh is not None:
+        nodes, w = roots_legendre(n_quad)
+        z = nodes * d / 2.0
+        wz = w * d / 2.0
+        phi = thickness_phi(z, nm, d)
+        M = (phi * (wz * dKh(z))) @ phi.T            # (nm, nm)
+        zz = np.outer([0, 0, 1.0], [0, 0, 1.0])
+        Hz = block_diag2(
+            T1.T @ (2 * (zz - m1[2] ** 2 * np.eye(3))) @ T1,
+            T2.T @ (2 * (zz - m2[2] ** 2 * np.eye(3))) @ T2)
+        Hbig += np.kron(M, Hz)
+
+    Hbig = 0.5 * (Hbig + Hbig.T)
+    J = np.kron(np.eye(2 * nm), np.array([[0.0, -1.0], [1.0, 0.0]]))
+    Dm = (GAMMA / p.Ms) * J @ Hbig
+
+    w_, V = np.linalg.eig(Dm)
+    idx = np.argsort(np.imag(w_))[::-1][:2 * nm]
+    idx = idx[np.argsort(np.imag(w_[idx]))]
+    freq = np.maximum(np.imag(w_[idx]), 0.0) / (2 * np.pi)
+    vecs = V[:, idx].copy()
+    for j in range(vecs.shape[1]):
+        v = vecs[:, j] / np.linalg.norm(vecs[:, j])
+        vecs[:, j] = v * np.exp(-1j * np.angle(v[np.argmax(np.abs(v))]))
+
+    n_weight = np.array([np.sum(np.abs(vecs[4 * n:4 * n + 4]) ** 2, axis=0)
+                         for n in range(nm)])
+    return {"frequency": freq, "eigenvectors": vecs, "n_weight": n_weight,
+            "equilibrium": (m1, m2), "tangent": (T1, T2), "d": d,
+            "n_modes": nm, "Hessian": Hbig, "dynamical_matrix": Dm}
+
+
+def thickness_profile(result, mode_index, z=None):
+    """
+    Reconstruct delta m_1(z), delta m_2(z) (Cartesian, complex) of one
+    thickness mode from its eigenvector, and delta l, delta m.
+
+    Returns z, dl (3, nz), dm (3, nz); normalised so the largest |dl| or |dm|
+    component has maximum 1 and the sign of Re is fixed at the lower surface.
+    """
+    d, nm = result["d"], result["n_modes"]
+    T1, T2 = result["tangent"]
+    if z is None:
+        z = np.linspace(-d / 2, d / 2, 400)
+    phi = thickness_phi(z, nm, d)                       # (nm, nz)
+    v = result["eigenvectors"][:, mode_index].reshape(nm, 4)
+    d1 = (T1 @ v[:, 0:2].T) @ phi                       # (3, nz)
+    d2 = (T2 @ v[:, 2:4].T) @ phi
+    dl, dm = 0.5 * (d1 - d2), 0.5 * (d1 + d2)
+    scale = max(np.abs(dl).max(), np.abs(dm).max())
+    dl, dm = dl / scale, dm / scale
+    dom = np.argmax(np.abs(dl).max(axis=1))
+    sgn = np.sign(dl[dom, 0].real) or 1.0
+    return z, sgn * dl, sgn * dm
+
 # ============================================================
 # Mode characterisation
 # ============================================================
@@ -752,47 +857,3 @@ def validate_spin_flop_state():
     print(f"  |m| calculated {np.linalg.norm(m):.6f}, expected {2.0/(2*10.0):.6f}")
     print(f"  l . B = {0.5*(m1-m2) @ normalize(B):.2e} (should be 0)")
     return r
-
-
-# ============================================================
-# Demo
-# ============================================================
-
-if __name__ == "__main__":
-    validate_afmr_limit()
-    print()
-    validate_dmi_limit()
-    print()
-    validate_spin_flop_state()
-
-    # --- example: easy-plane AFM + DMI + weak in-plane anisotropy -----
-    p = AFMParams.from_fields(
-        Ms=2e5, BE=10.0, Bh=0.1, Bip=0.01, BD=0.05,
-        A=1e-12, A12=-1e-12,
-    )
-
-    # f(H), field along the in-plane easy axis (x), up and down sweeps
-    fields = np.linspace(0.0, 1.5, 151)
-    f_up, _, res_up = sweep_field(fields, [1, 0, 0], p, follow=True)
-    f_dn, _, res_dn = sweep_field(fields[::-1], [1, 0, 0], p, follow=True)
-    f_dn = f_dn[:, np.argsort(f_dn[-1])]   # label branches by their B=0 order
-
-    fig = plot_frequency_sweep(fields, f_up, "B (T)",
-                               title="f(B) // x, up (solid) / down (dashed)",
-                               labels=["low (up)", "high (up)"])
-    plot_frequency_sweep(fields[::-1], f_dn, "B (T)", fig=fig, dash="dash",
-                         labels=["low (down)", "high (down)"])
-    fig.show()
-
-    plot_equilibrium(fields, res_up, "B (T)").show()
-
-    # f(k) at zero field
-    ks = np.linspace(0, 2e8, 100)
-    f_k, _, res_k = sweep_wavevector(ks, np.zeros(3), p)
-    plot_frequency_sweep(ks * 1e-9, f_k, "k (rad/nm)", title="f(k), B = 0").show()
-
-    # mode shapes at B = 0, k = 0
-    r0 = solve_modes(0.0, np.zeros(3), p)
-    for j in range(2):
-        print(describe_mode(r0, j))
-        plot_mode(r0, j).show()
